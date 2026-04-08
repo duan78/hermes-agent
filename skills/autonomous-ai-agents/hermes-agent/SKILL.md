@@ -296,7 +296,7 @@ Type these during an interactive chat session.
 ~/.hermes/sessions/         Session transcripts
 ~/.hermes/logs/             Gateway and error logs
 ~/.hermes/auth.json         OAuth tokens and credential pools
-~/.hermes/hermes-agent/     Source code (if git-installed)
+/path/to/hermes-agent/        Source code (wherever you cloned it)
 ```
 
 Profiles use `~/.hermes/profiles/<name>/` with the same layout.
@@ -541,7 +541,7 @@ grep -i "failed to send\|error" ~/.hermes/logs/gateway.log | tail -20
 | CLI commands | `hermes --help` or [CLI reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) |
 | Gateway logs | `~/.hermes/logs/gateway.log` |
 | Session files | `~/.hermes/sessions/` or `hermes sessions browse` |
-| Source code | `~/.hermes/hermes-agent/` |
+| Source code | `/path/to/hermes-agent/` (wherever you cloned it) |
 
 ---
 
