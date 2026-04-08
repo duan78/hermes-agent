@@ -442,6 +442,13 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    # Class-level dedup: tracks the last time a context-pressure warning was
+    # emitted per session_id.  Prevents spam when the gateway creates a fresh
+    # AIAgent instance for every incoming message.  Entries expire after
+    # _CONTEXT_PRESSURE_COOLDOWN seconds.
+    _context_pressure_last_warned: dict[str, float] = {}
+    _CONTEXT_PRESSURE_COOLDOWN: int = 300  # 5 minutes
+
     @property
     def base_url(self) -> str:
         return self._base_url
@@ -6020,6 +6027,7 @@ class AIAgent:
             _post_progress = _compressed_est / self.context_compressor.threshold_tokens
             if _post_progress < 0.85:
                 self._context_pressure_warned = False
+                AIAgent._context_pressure_last_warned.pop(self.session_id, None)
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same
@@ -8962,8 +8970,18 @@ class AIAgent:
                     if _compressor.threshold_tokens > 0:
                         _compaction_progress = _real_tokens / _compressor.threshold_tokens
                         if _compaction_progress >= 0.85 and not self._context_pressure_warned:
-                            self._context_pressure_warned = True
-                            self._emit_context_pressure(_compaction_progress, _compressor)
+                            # Time-based dedup: skip if this session was warned
+                            # recently (within the cooldown).  This prevents the
+                            # gateway from spamming the warning on every new
+                            # AIAgent instance created per message.
+                            _now = time.time()
+                            _last = AIAgent._context_pressure_last_warned.get(self.session_id, 0)
+                            if _now - _last < AIAgent._CONTEXT_PRESSURE_COOLDOWN:
+                                self._context_pressure_warned = True
+                            else:
+                                self._context_pressure_warned = True
+                                AIAgent._context_pressure_last_warned[self.session_id] = _now
+                                self._emit_context_pressure(_compaction_progress, _compressor)
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         messages, active_system_prompt = self._compress_context(

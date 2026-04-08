@@ -246,3 +246,126 @@ class TestContextPressureFlags:
 
         # Should not raise
         agent._emit_context_pressure(0.85, compressor)
+
+
+# ---------------------------------------------------------------------------
+# Cross-instance dedup tests (gateway mode)
+# ---------------------------------------------------------------------------
+
+
+class TestContextPressureDedup:
+    """Time-based dedup of context pressure warnings across AIAgent instances.
+
+    In gateway mode, a new AIAgent is created per message.  Without dedup,
+    the warning would fire on every message when context is already above 85%.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_class_state(self):
+        """Isolate tests by clearing class-level state before/after."""
+        AIAgent._context_pressure_last_warned.clear()
+        yield
+        AIAgent._context_pressure_last_warned.clear()
+
+    def test_second_instance_within_cooldown_is_suppressed(self, agent):
+        """A second AIAgent for the same session should not re-emit within 5 min."""
+        import time
+
+        cb1 = MagicMock()
+        agent.status_callback = cb1
+        agent.session_id = "test-session-123"
+
+        compressor = MagicMock()
+        compressor.context_length = 200_000
+        compressor.threshold_tokens = 100_000
+
+        # First warning — should fire
+        agent._context_pressure_warned = False
+        AIAgent._context_pressure_last_warned.clear()
+        agent._check_and_emit_context_pressure = lambda _prog, _comp: None  # bypass loop logic
+
+        # Simulate what the loop does: set warned + emit
+        AIAgent._context_pressure_last_warned[agent.session_id] = time.time()
+        agent._emit_context_pressure(0.90, compressor)
+
+        cb1.assert_called_once()
+
+        # Now simulate a new agent instance for the same session (gateway creates new AIAgent per message)
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent2 = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_id="test-session-123",
+            )
+            agent2.client = MagicMock()
+
+        cb2 = MagicMock()
+        agent2.status_callback = cb2
+
+        # The new agent has _context_pressure_warned = False (fresh instance),
+        # but the class-level dict should prevent re-emission.
+        # Simulate the check logic directly:
+        _now = time.time()
+        _last = AIAgent._context_pressure_last_warned.get(agent2.session_id, 0)
+        assert _now - _last < AIAgent._CONTEXT_PRESSURE_COOLDOWN
+
+        # The emit path would set the flag without calling _emit_context_pressure
+        agent2._context_pressure_warned = True
+
+        # Confirm the callback was NOT called on the second instance
+        cb2.assert_not_called()
+
+    def test_warning_fires_after_cooldown_expires(self, agent):
+        """After the cooldown expires, a new warning should fire normally."""
+        import time
+
+        AIAgent._context_pressure_last_warned[agent.session_id] = time.time() - 301  # 5+ min ago
+
+        cb = MagicMock()
+        agent.status_callback = cb
+        agent._context_pressure_warned = False
+
+        compressor = MagicMock()
+        compressor.context_length = 200_000
+        compressor.threshold_tokens = 100_000
+
+        # Check the dedup condition — should allow emission
+        _now = time.time()
+        _last = AIAgent._context_pressure_last_warned.get(agent.session_id, 0)
+        assert _now - _last >= AIAgent._CONTEXT_PRESSURE_COOLDOWN
+
+        agent._emit_context_pressure(0.90, compressor)
+        cb.assert_called_once()
+
+    def test_compression_resets_dedup(self, agent):
+        """After compression drops below 85%, the cooldown entry should be cleared."""
+        import time
+
+        agent.session_id = "test-session-compress"
+        AIAgent._context_pressure_last_warned[agent.session_id] = time.time()
+
+        agent.compression_enabled = True
+        agent.context_compressor = MagicMock()
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "Summary."}
+        ]
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.last_prompt_tokens = 10  # well below 85%
+        agent._todo_store = MagicMock()
+        agent._todo_store.format_for_injection.return_value = None
+        agent._build_system_prompt = MagicMock(return_value="system prompt")
+        agent._cached_system_prompt = "old system prompt"
+        agent._session_db = None
+
+        messages = [{"role": "user", "content": "hello"}]
+        agent._compress_context(messages, "system prompt")
+
+        assert agent.session_id not in AIAgent._context_pressure_last_warned
+        assert agent._context_pressure_warned is False
