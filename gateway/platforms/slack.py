@@ -814,7 +814,8 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
-        if not is_dm and bot_uid and not is_mentioned:
+        require_mention = self.config.extra.get("require_mention", True)
+        if not is_dm and bot_uid and not is_mentioned and require_mention:
             reply_to_bot_thread = (
                 is_thread_reply and event_thread_ts in self._bot_message_ts
             )
