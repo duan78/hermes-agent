@@ -88,7 +88,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "combined", "brave", "linkup", "agent_reach"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -117,6 +117,14 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "brave":
+        return _has_env("BRAVE_API_KEY")
+    if backend == "linkup":
+        return _has_env("LINKUP_API_KEY")
+    if backend == "combined":
+        return any(_is_backend_available(b) for b in ("tavily", "exa", "brave", "linkup", "parallel", "agent_reach"))
+    if backend == "agent_reach":
+        return _is_agent_reach_available()
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1031,6 +1039,238 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+# ─── Brave Search Helper ──────────────────────────────────────────────────────
+
+def _brave_search(query: str, limit: int = 10) -> dict:
+    """Search using the Brave Search API and return results as a dict."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("BRAVE_API_KEY", "").strip()
+    if not api_key:
+        return {"success": False, "error": "BRAVE_API_KEY not set"}
+
+    logger.info("Brave search: '%s' (limit=%d)", query, limit)
+    try:
+        import requests
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": limit},
+            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.error("Brave search failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+    web_results = []
+    for i, item in enumerate(data.get("web", {}).get("results", [])[:limit]):
+        web_results.append({
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "description": item.get("description", ""),
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+# ─── LinkUp Search Helper ─────────────────────────────────────────────────────
+
+def _linkup_search(query: str, limit: int = 10) -> dict:
+    """Search using the LinkUp API and return results as a dict."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("LINKUP_API_KEY", "").strip()
+    if not api_key:
+        return {"success": False, "error": "LINKUP_API_KEY not set"}
+
+    logger.info("LinkUp search: '%s' (limit=%d)", query, limit)
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.linkup.so/v1/search",
+            json={"query": query, "depth": "standard", "outputType": "searchResults"},
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.error("LinkUp search failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+    web_results = []
+    results = data.get("results", data.get("searchResults", []))
+    for i, item in enumerate(results[:limit]):
+        web_results.append({
+            "url": item.get("url", item.get("link", "")),
+            "title": item.get("title", item.get("name", "")),
+            "description": item.get("description", item.get("snippet", "")),
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+# ─── Agent-Reach Backend ──────────────────────────────────────────────────────
+
+def _is_agent_reach_available() -> bool:
+    """Check if Agent-Reach search channels (exa_search, web/Jina) are available."""
+    try:
+        from agent_reach.channels import get_all_channels
+        for ch in get_all_channels():
+            if ch.name in ("exa_search", "web"):
+                status_tuple = ch.check()
+                status = status_tuple[0] if isinstance(status_tuple, tuple) else str(status_tuple)
+                if status == "ok":
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _agent_reach_search(query: str, limit: int = 10) -> dict:
+    """Search using Agent-Reach channels (ExaSearch, Web/Jina Reader).
+
+    Only search-capable channels participate — platform channels (GitHub,
+    YouTube, etc.) are readers, not search engines.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    all_results: list[dict] = []
+
+    try:
+        from agent_reach.channels import get_channel
+
+        # ExaSearch channel
+        try:
+            ch = get_channel("exa_search")
+            if ch:
+                status_tuple = ch.check()
+                status = status_tuple[0] if isinstance(status_tuple, tuple) else str(status_tuple)
+                if status == "ok" and hasattr(ch, "search"):
+                    results = ch.search(query, limit=limit)
+                    for i, r in enumerate(results if isinstance(results, list) else []):
+                        all_results.append({
+                            "url": r.get("url", "") if isinstance(r, dict) else "",
+                            "title": r.get("title", "") if isinstance(r, dict) else "",
+                            "description": r.get("content", r.get("description", "")) if isinstance(r, dict) else "",
+                            "position": i + 1,
+                        })
+        except Exception as exc:
+            logger.debug("Agent-Reach exa_search failed: %s", exc)
+
+        # Web / Jina Reader channel
+        try:
+            ch = get_channel("web")
+            if ch:
+                status_tuple = ch.check()
+                status = status_tuple[0] if isinstance(status_tuple, tuple) else str(status_tuple)
+                if status == "ok" and hasattr(ch, "search"):
+                    results = ch.search(query, limit=limit)
+                    for i, r in enumerate(results if isinstance(results, list) else []):
+                        all_results.append({
+                            "url": r.get("url", "") if isinstance(r, dict) else "",
+                            "title": r.get("title", "") if isinstance(r, dict) else "",
+                            "description": r.get("content", r.get("description", "")) if isinstance(r, dict) else "",
+                            "position": i + 1,
+                        })
+        except Exception as exc:
+            logger.debug("Agent-Reach web channel failed: %s", exc)
+
+    except Exception as exc:
+        logger.warning("Agent-Reach search failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+    if not all_results:
+        return {"success": False, "error": "Agent-Reach returned no results"}
+
+    return {"success": True, "data": {"web": all_results[:limit]}}
+
+
+# ─── Combined Search Helper ────────────────────────────────────────────────────
+
+def _combined_search(query: str, limit: int = 10) -> dict:
+    """Query all available backends in parallel, deduplicate, and merge results."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    # Determine which backends are available
+    available_backends = [
+        name for name in ("tavily", "exa", "brave", "linkup", "parallel", "agent_reach")
+        if _is_backend_available(name)
+    ]
+
+    if not available_backends:
+        return {"success": False, "error": "No search backends available for combined mode"}
+
+    logger.info("Combined search: '%s' (limit=%d) — backends: %s", query, limit, available_backends)
+
+    # Map backend names to their callables
+    backend_funcs = {
+        "tavily": lambda q, l: _normalize_tavily_search_results(
+            _tavily_request("search", {"query": q, "max_results": min(l, 20),
+                                       "include_raw_content": False, "include_images": False})),
+        "exa": _exa_search,
+        "brave": _brave_search,
+        "linkup": _linkup_search,
+        "parallel": _parallel_search,
+        "agent_reach": _agent_reach_search,
+    }
+
+    # Run all available backends in parallel
+    all_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(available_backends)) as pool:
+        futures = {
+            pool.submit(backend_funcs[name], query, limit): name
+            for name in available_backends
+        }
+        for future in as_completed(futures):
+            bname = futures[future]
+            try:
+                result = future.result()
+                if result.get("success", False):
+                    items = result.get("data", {}).get("web", [])
+                    all_results.extend(items)
+                    logger.debug("Combined: %s returned %d results", bname, len(items))
+                else:
+                    logger.debug("Combined: %s failed: %s", bname, result.get("error", "unknown"))
+            except Exception as exc:
+                logger.warning("Combined: %s raised %s", bname, exc)
+
+    # Deduplicate by URL (keep first occurrence)
+    seen_urls = set()
+    unique_results = []
+    for item in all_results:
+        url = item.get("url", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append(item)
+
+    # Sort by position and take top N
+    unique_results.sort(key=lambda r: r.get("position", 999))
+    top_results = unique_results[:limit]
+
+    # Re-number positions 1..N
+    for i, item in enumerate(top_results):
+        item["position"] = i + 1
+
+    logger.info("Combined search: %d backends ran, %d total results, %d after dedup, %d returned",
+                len(available_backends), len(all_results), len(unique_results), len(top_results))
+
+    return {"success": True, "data": {"web": top_results}}
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -1110,6 +1350,33 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "combined":
+            response_data = _combined_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "brave":
+            response_data = _brave_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "linkup":
+            response_data = _linkup_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
