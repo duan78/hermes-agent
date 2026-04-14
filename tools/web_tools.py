@@ -44,6 +44,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import time
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
@@ -480,6 +482,58 @@ def _get_default_summarizer_model() -> Optional[str]:
     return model
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
+
+
+# ─── Search History Logging ──────────────────────────────────────────────────
+
+def _log_search_to_history(query, backend, results_count, result_data, elapsed_ms):
+    """Log a web search to the shared SQLite search history DB.
+
+    Non-blocking: any error is silently caught and logged.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        db_path = get_hermes_home() / "search_history.db"
+    except ImportError:
+        db_path = Path.home() / ".hermes" / "search_history.db"
+
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), timeout=3)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                query TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                results_count INTEGER DEFAULT 0,
+                elapsed_ms REAL DEFAULT 0,
+                top_urls TEXT,
+                top_titles TEXT,
+                response_size INTEGER DEFAULT 0,
+                session_id TEXT DEFAULT '',
+                platform TEXT DEFAULT ''
+            )
+        """)
+        # Extract top URLs and titles from result_data
+        top_urls = []
+        top_titles = []
+        web_items = result_data.get("data", {}).get("web", [])
+        for item in web_items[:5]:
+            if item.get("url"):
+                top_urls.append(item["url"])
+            if item.get("title"):
+                top_titles.append(item["title"])
+
+        response_size = len(json.dumps(result_data)) if result_data else 0
+        conn.execute(
+            "INSERT INTO search_history (query, backend, results_count, elapsed_ms, top_urls, top_titles, response_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (query, backend, results_count, elapsed_ms, json.dumps(top_urls), json.dumps(top_titles), response_size),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.debug("search_history log failed: %s", exc)
 
 
 async def process_content_with_llm(
@@ -1322,23 +1376,28 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             return tool_error("Interrupted", success=False)
 
         # Dispatch to the configured backend
+        _search_t0 = time.time()
         backend = _get_backend()
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         if backend == "exa":
             response_data = _exa_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         if backend == "tavily":
@@ -1350,38 +1409,57 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         if backend == "combined":
             response_data = _combined_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         if backend == "brave":
             response_data = _brave_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         if backend == "linkup":
             response_data = _linkup_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
+            return result_json
+
+        if backend == "agent_reach":
+            response_data = _agent_reach_search(query, limit)
+            _search_elapsed = (time.time() - _search_t0) * 1000
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            _log_search_to_history(query, backend, debug_call_data["results_count"], response_data, _search_elapsed)
             return result_json
 
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
@@ -1393,8 +1471,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         web_results = _extract_web_search_results(response)
         results_count = len(web_results)
+        _search_elapsed = (time.time() - _search_t0) * 1000
         logger.info("Found %d search results", results_count)
-        
+
         # Build response with just search metadata (URLs, titles, descriptions)
         response_data = {
             "success": True,
@@ -1402,19 +1481,20 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "web": web_results
             }
         }
-        
+
         # Capture debug information
         debug_call_data["results_count"] = results_count
-        
+
         # Convert to JSON
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-        
+
         debug_call_data["final_response_size"] = len(result_json)
-        
+
         # Log debug information
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        
+        _log_search_to_history(query, "firecrawl", results_count, response_data, _search_elapsed)
+
         return result_json
         
     except Exception as e:
